@@ -42,6 +42,20 @@ class ClaudeRunner:
         self._active.clear()
         self._cancelled.clear()
 
+    @staticmethod
+    def _session_exists(session_id: str, project_dir: Path) -> bool:
+        """Check if a Claude session file exists on disk."""
+        # Claude stores sessions in ~/.claude/projects/<slug>/<session_id>.jsonl
+        # The slug replaces path separators with dashes
+        claude_dir = Path.home() / ".claude" / "projects"
+        slug = str(project_dir).replace("/", "-").replace("\\", "-").replace(":", "-")
+        # Try with and without leading dash (Windows drives produce leading dash)
+        for candidate in [slug, slug.lstrip("-")]:
+            session_file = claude_dir / candidate / f"{session_id}.jsonl"
+            if session_file.exists():
+                return True
+        return False
+
     async def run(
         self,
         prompt: str,
@@ -54,37 +68,42 @@ class ClaudeRunner:
             yield StreamEvent(type="error", content="Claude is already running for this project.")
             return
 
-        cmd = ["claude", "-p", "--output-format", "stream-json"]
+        # Validate session before using it
+        if session_id and not self._session_exists(session_id, project_dir):
+            print(f"[claude] Session {session_id} not found on disk, starting fresh.", flush=True)
+            session_id = None
+
+        cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json"]
 
         if resume and session_id:
-            cmd.extend(["--resume", "--session-id", session_id, "--fork-session"])
+            cmd.extend(["--resume", session_id, "--fork-session"])
         elif session_id:
-            cmd.extend(["--continue", "--session-id", session_id, "--fork-session"])
+            cmd.extend(["--continue", session_id, "--fork-session"])
 
         cmd.append(prompt)
 
-        # Build clean environment — remove CLAUDECODE to avoid nested-session refusal
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        # Build clean environment — remove Claude session markers to avoid nested-session refusal
+        _strip_vars = {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"}
+        env = {k: v for k, v in os.environ.items() if k not in _strip_vars}
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(project_dir),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            proc = await self._launch(cmd, project_dir, env)
             self._active[thread_id] = proc
+
+            # Start draining stderr immediately
+            stderr_task = asyncio.create_task(self._drain_stderr(proc))
 
             async for event in self._parse_stream(proc):
                 yield event
 
-            # Check for errors on stderr
-            stderr_data = await proc.stderr.read()
-            if proc.returncode != 0 and stderr_data:
+            # Wait for the process to finish and collect stderr
+            await proc.wait()
+            stderr_chunks = await stderr_task
+            if proc.returncode != 0:
+                all_stderr = "".join(stderr_chunks).strip()[:500]
                 yield StreamEvent(
                     type="error",
-                    content=f"Claude exited with code {proc.returncode}: {stderr_data.decode(errors='replace')[:500]}",
+                    content=f"Claude exited with code {proc.returncode}: {all_stderr}" if all_stderr else f"Claude exited with code {proc.returncode}",
                 )
 
         except FileNotFoundError:
@@ -97,6 +116,35 @@ class ClaudeRunner:
             self._active.pop(thread_id, None)
             if was_cancelled:
                 yield StreamEvent(type="cancelled")
+
+    async def _launch(
+        self, cmd: list[str], project_dir: Path, env: dict[str, str]
+    ) -> asyncio.subprocess.Process:
+        """Launch a subprocess and return it."""
+        print(f"[claude] Starting: {' '.join(cmd)}", flush=True)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(project_dir),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        print(f"[claude] Process started (PID {proc.pid})", flush=True)
+        return proc
+
+    async def _drain_stderr(self, proc: asyncio.subprocess.Process) -> list[str]:
+        """Read stderr continuously so the pipe buffer never fills up. Returns collected chunks."""
+        assert proc.stderr is not None
+        chunks: list[str] = []
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                break
+            text = chunk.decode(errors="replace")
+            chunks.append(text)
+            print(f"[claude stderr] {text}", end="", flush=True)
+            log.debug("claude stderr: %s", text.strip())
+        return chunks
 
     async def _parse_stream(
         self, proc: asyncio.subprocess.Process

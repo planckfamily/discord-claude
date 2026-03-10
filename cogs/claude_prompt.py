@@ -79,6 +79,8 @@ class ClaudePromptCog(commands.Cog):
 
         tick_task = asyncio.create_task(tick_loop())
 
+        print(f"\n{'='*60}\n[{message.author}] {prompt}\n{'='*60}", flush=True)
+
         try:
             async for event in runner.run(
                 prompt=prompt,
@@ -88,14 +90,18 @@ class ClaudePromptCog(commands.Cog):
                 resume=resume,
             ):
                 if event.type == "text":
+                    print(event.content, end="", flush=True)
                     await streamer.feed(event.content)
                 elif event.type == "cancelled":
+                    print("\n[Cancelled]", flush=True)
                     await streamer.send_cancelled()
                     return
                 elif event.type == "error":
+                    print(f"\n[Error] {event.content}", flush=True)
                     await streamer.send_error(event.content)
                     return
                 elif event.type == "result":
+                    print(flush=True)  # final newline after streaming
                     # Update session_id if returned
                     if event.session_id and feature:
                         from core.state import load_project_state, save_project_state
