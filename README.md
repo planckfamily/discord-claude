@@ -25,6 +25,7 @@ A Discord bot that integrates the [Claude CLI](https://claude.com/claude-code) i
 ## Prerequisites
 
 - Python 3.11+
+- [Git](https://git-scm.com/)
 - [Claude CLI](https://claude.com/claude-code) installed and available on PATH
 - A Discord bot with a token (see [Discord Developer Portal](https://discord.com/developers/applications))
 
@@ -92,12 +93,14 @@ See [Creating a Discord Bot](#creating-a-discord-bot) above for how to obtain yo
 
 ## Running the Bot
 
-**With the virtual environment (recommended):**
+**With the start scripts (recommended):**
 
 ```bash
 ./start.sh          # Linux / macOS / Git Bash
 .\start.ps1         # Windows (PowerShell)
 ```
+
+Using the start scripts is recommended because they automatically restart the bot when it is updated via Discord (e.g. when Claude modifies the bot's own code in response to a prompt). Running `python bot.py` directly will not restart after such changes.
 
 **Without:**
 
@@ -117,6 +120,7 @@ python bot.py
 | `/list-features` | Show all features for the current project |
 | `/status` | Show whether Claude is running and the active feature |
 | `/cancel` | Cancel the running Claude process |
+| `/reset-context` | Reset the Claude session to start with a fresh context window |
 
 ## Project Structure
 

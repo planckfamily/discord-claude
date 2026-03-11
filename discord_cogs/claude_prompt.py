@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import subprocess
+from dataclasses import dataclass
 
 import discord
 from discord.ext import commands
@@ -10,9 +11,20 @@ from core.discord_streamer import DiscordStreamer
 log = logging.getLogger(__name__)
 
 
+@dataclass
+class QueuedPrompt:
+    message: discord.Message
+    prompt: str
+    project: object  # Project dataclass
+
+
 class ClaudePromptCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # thread_id -> asyncio.Queue of QueuedPrompt
+        self._queues: dict[int, asyncio.Queue[QueuedPrompt]] = {}
+        # thread_id -> worker task
+        self._workers: dict[int, asyncio.Task] = {}
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -43,12 +55,52 @@ class ClaudePromptCog(commands.Cog):
             await message.channel.send("Send a prompt after mentioning me.")
             return
 
-        # Check if Claude is already running for this project
-        runner = self.bot.claude_runner
-        if runner.is_busy(message.channel.id):
-            await message.channel.send("Claude is already working on something in this project. Please wait or use `/cancel`.")
+        thread_id = message.channel.id
+        queued = QueuedPrompt(message=message, prompt=prompt, project=project)
+
+        # Get or create queue for this thread
+        if thread_id not in self._queues:
+            self._queues[thread_id] = asyncio.Queue()
+
+        queue = self._queues[thread_id]
+
+        # If a worker is already running, queue the prompt
+        if thread_id in self._workers and not self._workers[thread_id].done():
+            await queue.put(queued)
+            position = queue.qsize()
+            await message.add_reaction("\U0001f4cb")  # clipboard emoji = queued
+            await message.channel.send(f"*Queued (position {position}). I'll get to this after the current prompt finishes.*")
             return
 
+        # No worker running — put it in the queue and start the worker
+        await queue.put(queued)
+        self._workers[thread_id] = asyncio.create_task(self._worker(thread_id))
+
+    async def _worker(self, thread_id: int) -> None:
+        """Process queued prompts for a thread, one at a time."""
+        queue = self._queues[thread_id]
+        try:
+            while not queue.empty():
+                item = await queue.get()
+                try:
+                    await self._process_prompt(item)
+                except Exception as e:
+                    log.exception("Error processing queued prompt")
+                    try:
+                        await item.message.channel.send(f"**Error:** {e}")
+                    except discord.HTTPException:
+                        pass
+        finally:
+            # Clean up if the queue is empty
+            if queue.empty():
+                self._queues.pop(thread_id, None)
+                self._workers.pop(thread_id, None)
+
+    async def _process_prompt(self, item: QueuedPrompt) -> None:
+        message = item.message
+        prompt = item.prompt
+        project = item.project
+        runner = self.bot.claude_runner
         project_dir = self.bot.project_manager.get_project_dir(project)
 
         # Get session_id: prefer active feature's session, fall back to project default
@@ -73,16 +125,24 @@ class ClaudePromptCog(commands.Cog):
 
         tick_task = asyncio.create_task(tick_loop())
 
-        # Snapshot working tree state so we can detect changes
+        # Snapshot full diff state so we can detect any changes (committed or not)
         is_self = self.bot.is_self_project(project_dir)
-        git_snapshot = None
+        diff_snapshot = None
         if is_self:
             try:
-                git_snapshot = subprocess.check_output(
-                    ["git", "status", "--porcelain"],
+                # Capture uncommitted diff (staged + unstaged) and HEAD hash
+                # Together these detect both committed and uncommitted changes
+                uncommitted = subprocess.check_output(
+                    ["git", "diff", "HEAD"],
                     cwd=str(project_dir),
                     timeout=5,
                 ).decode()
+                head = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=str(project_dir),
+                    timeout=5,
+                ).decode().strip()
+                diff_snapshot = (head, uncommitted)
             except Exception:
                 pass
 
@@ -109,16 +169,19 @@ class ClaudePromptCog(commands.Cog):
                     return
                 elif event.type == "result":
                     print(flush=True)  # final newline after streaming
-                    # Persist the session_id Claude returned
-                    if event.session_id:
+                    # Persist session_id and model
+                    if event.session_id or event.model:
                         from core.state import load_project_state, save_project_state
 
                         state = load_project_state(project_dir)
-                        # Save to feature if active
-                        if feature and feature.name in state.get("features", {}):
-                            state["features"][feature.name]["session_id"] = event.session_id
-                        # Always save as project default
-                        state["default_session_id"] = event.session_id
+                        if event.session_id:
+                            # Save to feature if active
+                            if feature and feature.name in state.get("features", {}):
+                                state["features"][feature.name]["session_id"] = event.session_id
+                            # Always save as project default
+                            state["default_session_id"] = event.session_id
+                        if event.model:
+                            state["model"] = event.model
                         save_project_state(project_dir, state)
 
                     # Show per-prompt usage, context window, and session totals
@@ -151,15 +214,22 @@ class ClaudePromptCog(commands.Cog):
                             cost_usd=event.cost_usd or 0.0,
                             feature_name=feature.name if feature else None,
                         )
-                        session_total = totals["total_input_tokens"] + totals["total_output_tokens"]
                         session_label = f"feature `{feature.name}`" if feature else "session"
-                        session_cost = f" | ${totals['total_cost_usd']:.4f}" if totals["total_cost_usd"] else ""
+
+                        model_str = f"*model: `{event.model}`*\n" if event.model else ""
+                        session_id_str = f"*session: `{event.session_id}`*\n" if event.session_id else ""
+
+                        session_line = ""
+                        if totals["total_cost_usd"]:
+                            session_line = f"\n*{session_label}: ${totals['total_cost_usd']:.4f} across {totals['prompt_count']} prompt(s)*"
 
                         await streamer.feed(
                             f"\n\n---\n"
+                            f"{model_str}"
+                            f"{session_id_str}"
                             f"*this prompt: {prompt_in:,} in + {prompt_out:,} out = {prompt_total:,} tokens{cost_str}*\n"
-                            f"*{indicator} context: {prompt_in:,} / {event.context_window:,} tokens ({context_pct:.1f}%)*\n"
-                            f"*{session_label} total: {session_total:,} tokens across {totals['prompt_count']} prompt(s){session_cost}*"
+                            f"*{indicator} context: {prompt_in:,} / {event.context_window:,} tokens ({context_pct:.1f}%)*"
+                            f"{session_line}"
                             f"{warning}"
                         )
 
@@ -174,14 +244,20 @@ class ClaudePromptCog(commands.Cog):
             )
 
             # Auto-restart if the bot's own code was actually modified
-            if is_self and git_snapshot is not None:
+            if is_self and diff_snapshot is not None:
                 try:
-                    current = subprocess.check_output(
-                        ["git", "status", "--porcelain"],
+                    old_head, old_diff = diff_snapshot
+                    uncommitted = subprocess.check_output(
+                        ["git", "diff", "HEAD"],
                         cwd=str(project_dir),
                         timeout=5,
                     ).decode()
-                    if current != git_snapshot:
+                    head = subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=str(project_dir),
+                        timeout=5,
+                    ).decode().strip()
+                    if head != old_head or uncommitted != old_diff:
                         await self.bot.request_restart(channel=message.channel)
                 except Exception:
                     pass

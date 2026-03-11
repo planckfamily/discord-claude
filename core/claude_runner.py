@@ -80,9 +80,8 @@ class ClaudeRunner:
         # Use -- to prevent prompt from being parsed as a flag
         cmd.extend(["--", prompt])
 
-        # Build clean environment — remove Claude session markers to avoid nested-session refusal
-        _strip_vars = {"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"}
-        env = {k: v for k, v in os.environ.items() if k not in _strip_vars}
+        # Build clean environment
+        env = {k: v for k, v in os.environ.items()}
 
         try:
             log.info("Starting: %s", " ".join(cmd))
@@ -143,6 +142,7 @@ class ClaudeRunner:
         assert proc.stdout is not None
 
         buffer = b""
+        has_emitted_text = False
         while True:
             chunk = await proc.stdout.read(4096)
             if not chunk:
@@ -157,15 +157,17 @@ class ClaudeRunner:
                 line = line.strip()
                 if not line:
                     continue
-                for event in self._parse_line(line):
+                for event in self._parse_line(line, has_emitted_text):
+                    if event.type == "text" and event.content.strip():
+                        has_emitted_text = True
                     yield event
 
         # Process any remaining buffer
         if buffer.strip():
-            for event in self._parse_line(buffer.strip()):
+            for event in self._parse_line(buffer.strip(), has_emitted_text):
                 yield event
 
-    def _parse_line(self, line: bytes) -> list[StreamEvent]:
+    def _parse_line(self, line: bytes, has_emitted_text: bool = False) -> list[StreamEvent]:
         try:
             data = json.loads(line)
         except json.JSONDecodeError:
@@ -180,8 +182,12 @@ class ClaudeRunner:
             text_parts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
             if not text_parts:
                 return []
+            combined = "".join(text_parts)
+            # Separate from previous text (e.g. after a tool_use turn)
+            if has_emitted_text:
+                combined = "\n\n" + combined
             # Split into paragraphs so Discord messages stream naturally
-            paragraphs = "".join(text_parts).split("\n\n")
+            paragraphs = combined.split("\n\n")
             return [
                 StreamEvent(type="text", content=para + ("\n\n" if i < len(paragraphs) - 1 else ""))
                 for i, para in enumerate(paragraphs) if para or i < len(paragraphs) - 1
@@ -197,7 +203,9 @@ class ClaudeRunner:
         if msg_type == "result":
             log.info("Result payload: cost_usd=%s, modelUsage=%s", data.get("cost_usd"), data.get("modelUsage"))
             cost_raw = data.get("cost_usd") or data.get("total_cost_usd")
-            usage = next(iter(data.get("modelUsage", {}).values()), {})
+            model_usage = data.get("modelUsage", {})
+            model_name = next(iter(model_usage.keys()), None)
+            usage = next(iter(model_usage.values()), {})
             result = data.get("result", "")
 
             return [StreamEvent(
@@ -210,6 +218,7 @@ class ClaudeRunner:
                               + usage.get("cacheCreationInputTokens", 0)) if usage else None,
                 output_tokens=usage.get("outputTokens") if usage else None,
                 context_window=usage.get("contextWindow") if usage else None,
+                model=model_name,
             )]
 
         return []
