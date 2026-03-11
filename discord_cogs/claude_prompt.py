@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import subprocess
 
 import discord
 from discord.ext import commands
@@ -71,6 +72,19 @@ class ClaudePromptCog(commands.Cog):
                 await streamer.tick()
 
         tick_task = asyncio.create_task(tick_loop())
+
+        # Snapshot working tree state so we can detect changes
+        is_self = self.bot.is_self_project(project_dir)
+        git_snapshot = None
+        if is_self:
+            try:
+                git_snapshot = subprocess.check_output(
+                    ["git", "status", "--porcelain"],
+                    cwd=str(project_dir),
+                    timeout=5,
+                ).decode()
+            except Exception:
+                pass
 
         print(f"\n{'='*60}\n[{message.author}] {prompt}\n{'='*60}", flush=True)
 
@@ -158,6 +172,19 @@ class ClaudePromptCog(commands.Cog):
                 prompt_summary=prompt,
                 feature_name=feature.name if feature else None,
             )
+
+            # Auto-restart if the bot's own code was actually modified
+            if is_self and git_snapshot is not None:
+                try:
+                    current = subprocess.check_output(
+                        ["git", "status", "--porcelain"],
+                        cwd=str(project_dir),
+                        timeout=5,
+                    ).decode()
+                    if current != git_snapshot:
+                        await self.bot.request_restart(channel=message.channel)
+                except Exception:
+                    pass
 
         except Exception as e:
             log.exception("Error during Claude prompt relay")

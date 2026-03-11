@@ -39,6 +39,9 @@ intents.guilds = True
 intents.members = True
 
 
+RESTART_EXIT_CODE = 42
+
+
 class ClaudeBot(commands.Bot):
     def __init__(self) -> None:
         super().__init__(command_prefix="!", intents=intents)
@@ -49,6 +52,7 @@ class ClaudeBot(commands.Bot):
             guild_id=int(GUILD_ID),
             channel_id=int(CHANNEL_ID),
         )
+        self._restart_requested = False
 
     async def setup_hook(self) -> None:
         await self.load_extension("discord_cogs.projects")
@@ -73,6 +77,22 @@ class ClaudeBot(commands.Bot):
         else:
             log.info("No projects found in workspace")
 
+    def is_self_project(self, project_dir) -> bool:
+        """Check if a project directory is the bot's own codebase."""
+        from pathlib import Path
+        try:
+            return Path(project_dir).resolve() == Path(__file__).resolve().parent
+        except (OSError, ValueError):
+            return False
+
+    async def request_restart(self, channel=None) -> None:
+        """Signal the bot to restart after shutdown."""
+        self._restart_requested = True
+        log.info("Restart requested — shutting down for reboot...")
+        if channel:
+            await channel.send("Restarting to apply changes... be right back.")
+        await self.close()
+
     async def close(self) -> None:
         log.info("Shutting down — cancelling active Claude processes...")
         await self.claude_runner.cancel_all()
@@ -87,6 +107,10 @@ def main() -> None:
         bot.run(DISCORD_TOKEN, log_handler=None)
     except KeyboardInterrupt:
         log.info("Interrupted")
+
+    if bot._restart_requested:
+        log.info("Exiting with code %d to trigger restart", RESTART_EXIT_CODE)
+        sys.exit(RESTART_EXIT_CODE)
 
 
 if __name__ == "__main__":
