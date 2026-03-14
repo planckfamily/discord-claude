@@ -159,19 +159,23 @@ class ClaudePromptCog(commands.Cog):
         diff_snapshot = None
         if is_self:
             try:
-                # Capture uncommitted diff (staged + unstaged) and HEAD hash
-                # Together these detect both committed and uncommitted changes
-                uncommitted = subprocess.check_output(
-                    ["git", "diff", "HEAD"],
-                    cwd=str(project_dir),
-                    timeout=5,
-                ).decode()
-                head = subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=str(project_dir),
-                    timeout=5,
-                ).decode().strip()
-                diff_snapshot = (head, uncommitted)
+                diff_proc, head_proc = await asyncio.gather(
+                    asyncio.create_subprocess_exec(
+                        "git", "diff", "HEAD",
+                        cwd=str(project_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    ),
+                    asyncio.create_subprocess_exec(
+                        "git", "rev-parse", "HEAD",
+                        cwd=str(project_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    ),
+                )
+                diff_out, _ = await asyncio.wait_for(diff_proc.communicate(), timeout=5)
+                head_out, _ = await asyncio.wait_for(head_proc.communicate(), timeout=5)
+                diff_snapshot = (head_out.decode().strip(), diff_out.decode())
             except Exception:
                 pass
 
@@ -276,16 +280,24 @@ class ClaudePromptCog(commands.Cog):
             if is_self and diff_snapshot is not None:
                 try:
                     old_head, old_diff = diff_snapshot
-                    uncommitted = subprocess.check_output(
-                        ["git", "diff", "HEAD"],
-                        cwd=str(project_dir),
-                        timeout=5,
-                    ).decode()
-                    head = subprocess.check_output(
-                        ["git", "rev-parse", "HEAD"],
-                        cwd=str(project_dir),
-                        timeout=5,
-                    ).decode().strip()
+                    diff_proc, head_proc = await asyncio.gather(
+                        asyncio.create_subprocess_exec(
+                            "git", "diff", "HEAD",
+                            cwd=str(project_dir),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        ),
+                        asyncio.create_subprocess_exec(
+                            "git", "rev-parse", "HEAD",
+                            cwd=str(project_dir),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        ),
+                    )
+                    diff_out, _ = await asyncio.wait_for(diff_proc.communicate(), timeout=5)
+                    head_out, _ = await asyncio.wait_for(head_proc.communicate(), timeout=5)
+                    head = head_out.decode().strip()
+                    uncommitted = diff_out.decode()
                     if head != old_head or uncommitted != old_diff:
                         await self.bot.request_restart(channel=message.channel)
                 except Exception:
