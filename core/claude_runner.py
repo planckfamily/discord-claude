@@ -201,23 +201,53 @@ class ClaudeRunner:
 
         # Handle result/final message
         if msg_type == "result":
-            log.info("Result payload: cost_usd=%s, modelUsage=%s", data.get("cost_usd"), data.get("modelUsage"))
             cost_raw = data.get("cost_usd") or data.get("total_cost_usd")
+            num_turns = data.get("num_turns", 1)
             model_usage = data.get("modelUsage", {})
             model_name = next(iter(model_usage.keys()), None)
             usage = next(iter(model_usage.values()), {})
+
+            log.info(
+                "Result payload: cost_usd=%s, num_turns=%s, usage=%s, all_keys=%s",
+                cost_raw, num_turns, usage, list(data.keys()),
+            )
+
             result = data.get("result", "")
+
+            # modelUsage aggregates across all API turns in the invocation.
+            # For context-window fill we want the LAST turn's input tokens,
+            # which is roughly total / num_turns for multi-turn (tool-use) calls.
+            total_in = (usage.get("inputTokens", 0)
+                        + usage.get("cacheReadInputTokens", 0)
+                        + usage.get("cacheCreationInputTokens", 0)) if usage else None
+
+            # Estimate last-turn context size for multi-turn invocations
+            if total_in and num_turns > 1:
+                # Each successive turn is slightly larger than the last, but
+                # dividing gives a reasonable lower-bound estimate.
+                estimated_context = total_in // num_turns
+            else:
+                estimated_context = total_in
+
+            # context_window: try modelUsage first, fall back to known defaults
+            context_window = usage.get("contextWindow") if usage else None
+            if not context_window and model_name:
+                # Sensible defaults for known model families
+                if "opus" in model_name:
+                    context_window = 200000
+                elif "sonnet" in model_name:
+                    context_window = 200000
+                elif "haiku" in model_name:
+                    context_window = 200000
 
             return [StreamEvent(
                 type="result",
                 content=result if isinstance(result, str) else "",
                 session_id=data.get("session_id"),
                 cost_usd=float(cost_raw) if cost_raw is not None else None,
-                input_tokens=(usage.get("inputTokens", 0)
-                              + usage.get("cacheReadInputTokens", 0)
-                              + usage.get("cacheCreationInputTokens", 0)) if usage else None,
+                input_tokens=estimated_context,
                 output_tokens=usage.get("outputTokens") if usage else None,
-                context_window=usage.get("contextWindow") if usage else None,
+                context_window=context_window,
                 model=model_name,
             )]
 
