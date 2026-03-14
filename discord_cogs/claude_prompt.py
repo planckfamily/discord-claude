@@ -32,27 +32,50 @@ class ClaudePromptCog(commands.Cog):
         if message.author == self.bot.user:
             return
 
-        # Ignore messages that aren't in a thread
-        if not isinstance(message.channel, discord.Thread):
-            return
-
         # Must mention the bot
         if self.bot.user not in message.mentions:
             return
 
-        # Resolve project from thread
-        project = self.bot.project_manager.get_project_by_thread(message.channel.id)
-        if not project:
-            return
-
         # Strip the bot mention from the prompt
-        prompt = message.content
-        for mention_str in [f"<@{self.bot.user.id}>", f"<@!{self.bot.user.id}>"]:
-            prompt = prompt.replace(mention_str, "")
-        prompt = prompt.strip()
+        prompt = self._strip_mention(message.content)
 
         if not prompt:
             await message.channel.send("Send a prompt after mentioning me.")
+            return
+
+        # --- Main channel @mention (not in a thread) ---
+        if not isinstance(message.channel, discord.Thread):
+            # Only respond in the configured channel
+            if message.channel.id != self.bot.project_manager.channel_id:
+                return
+
+            # Augment prompt with project context so Claude can suggest the right thread
+            project_context = self._build_project_context()
+            augmented_prompt = prompt + project_context
+
+            channel_id = message.channel.id
+            queued = QueuedPrompt(message=message, prompt=augmented_prompt, project=None)
+
+            if channel_id not in self._queues:
+                self._queues[channel_id] = asyncio.Queue()
+
+            queue = self._queues[channel_id]
+
+            if channel_id in self._workers and not self._workers[channel_id].done():
+                await queue.put(queued)
+                position = queue.qsize()
+                await message.add_reaction("\U0001f4cb")
+                await message.channel.send(f"*Queued (position {position}). I'll get to this after the current prompt finishes.*")
+                return
+
+            await queue.put(queued)
+            self._workers[channel_id] = asyncio.create_task(self._worker(channel_id))
+            return
+
+        # --- Thread @mention ---
+        # Resolve project from thread
+        project = self.bot.project_manager.get_project_by_thread(message.channel.id)
+        if not project:
             return
 
         thread_id = message.channel.id
@@ -101,10 +124,16 @@ class ClaudePromptCog(commands.Cog):
         prompt = item.prompt
         project = item.project
         runner = self.bot.claude_runner
-        project_dir = self.bot.project_manager.get_project_dir(project)
+
+        # Main channel queries run against the bot's own project directory
+        if project is None:
+            from pathlib import Path
+            project_dir = Path(__file__).resolve().parent.parent
+        else:
+            project_dir = self.bot.project_manager.get_project_dir(project)
 
         # Get session_id: prefer active feature's session, fall back to project default
-        feature = self.bot.feature_manager.get_current_feature(project_dir)
+        feature = self.bot.feature_manager.get_current_feature(project_dir) if project else None
         session_id = feature.session_id if feature else None
         if not session_id:
             from core.state import load_project_state

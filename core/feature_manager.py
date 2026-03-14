@@ -26,7 +26,7 @@ class FeatureManager:
         save_project_state(project_dir, state)
         return feature
 
-    def switch_feature(self, project_dir: Path, name: str) -> Feature | None:
+    def resume_feature(self, project_dir: Path, name: str) -> Feature | None:
         state = load_project_state(project_dir)
         features = state.get("features", {})
 
@@ -38,7 +38,9 @@ class FeatureManager:
         if current and current in features:
             features[current]["status"] = "paused"
 
-        # Activate target
+        # Activate target — give it a fresh session if it was completed or has no session
+        if features[name].get("status") == "completed" or not features[name].get("session_id"):
+            features[name]["session_id"] = str(uuid.uuid4())
         features[name]["status"] = "active"
         state["current_feature"] = name
         state["features"] = features
