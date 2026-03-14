@@ -94,7 +94,8 @@ class ClaudePromptCog(commands.Cog):
                 await queue.put(queued)
                 position = queue.qsize()
                 await message.add_reaction("\U0001f4cb")
-                await message.channel.send(f"*Queued (position {position}). I'll get to this after the current prompt finishes.*")
+                preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
+                await message.channel.send(f"*Queued (position {position}):* `{preview}`")
                 return
 
             await queue.put(queued)
