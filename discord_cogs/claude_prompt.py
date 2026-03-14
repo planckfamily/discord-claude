@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import subprocess
 from dataclasses import dataclass
 
 import discord
@@ -25,6 +24,27 @@ class ClaudePromptCog(commands.Cog):
         self._queues: dict[int, asyncio.Queue[QueuedPrompt]] = {}
         # thread_id -> worker task
         self._workers: dict[int, asyncio.Task] = {}
+
+    def _strip_mention(self, content: str) -> str:
+        """Remove bot mention from message content."""
+        prompt = content
+        for mention_str in [f"<@{self.bot.user.id}>", f"<@!{self.bot.user.id}>"]:
+            prompt = prompt.replace(mention_str, "")
+        return prompt.strip()
+
+    def _build_project_context(self) -> str:
+        """Build a context string listing all known projects and their thread IDs."""
+        pm = self.bot.project_manager
+        projects = pm.projects
+        if not projects:
+            return ""
+
+        lines = ["\n\nThe following projects are available, each with a dedicated Discord thread:"]
+        for name, project in sorted(projects.items()):
+            feature = self.bot.feature_manager.get_current_feature(pm.get_project_dir(project))
+            feat_str = f" (active feature: {feature.name})" if feature else ""
+            lines.append(f"- {name}: thread <#{project.thread_id}>{feat_str}")
+        return "\n".join(lines)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -218,28 +238,33 @@ class ClaudePromptCog(commands.Cog):
                         save_project_state(project_dir, state)
 
                     # Show per-prompt usage, context window, and session totals
-                    if event.input_tokens is not None and event.context_window:
+                    if event.input_tokens is not None:
                         prompt_in = event.input_tokens
                         prompt_out = event.output_tokens or 0
                         prompt_total = prompt_in + prompt_out
-                        context_pct = prompt_in / event.context_window * 100
                         cost_str = f" | ${event.cost_usd:.4f}" if event.cost_usd else ""
 
-                        # Context health indicator
-                        if context_pct >= 85:
-                            indicator = "\U0001f534"   # red circle
-                            warning = "\n**\u26a0\ufe0f Context window critically full — wrap up this feature now!**"
-                        elif context_pct >= 70:
-                            indicator = "\U0001f7e0"   # orange circle
-                            warning = "\n**\u26a0\ufe0f Context window getting large — consider finishing soon.**"
-                        elif context_pct >= 50:
-                            indicator = "\U0001f7e1"   # yellow circle
-                            warning = "\n*Context window over 50% — keep an eye on it.*"
+                        # Context health indicator (only if we know the window size)
+                        context_line = ""
+                        warning = ""
+                        if event.context_window:
+                            context_pct = prompt_in / event.context_window * 100
+                            if context_pct >= 85:
+                                indicator = "\U0001f534"   # red circle
+                                warning = "\n**\u26a0\ufe0f Context window critically full — wrap up this feature now!**"
+                            elif context_pct >= 70:
+                                indicator = "\U0001f7e0"   # orange circle
+                                warning = "\n**\u26a0\ufe0f Context window getting large — consider finishing soon.**"
+                            elif context_pct >= 50:
+                                indicator = "\U0001f7e1"   # yellow circle
+                                warning = "\n*Context window over 50% — keep an eye on it.*"
+                            else:
+                                indicator = "\U0001f7e2"   # green circle
+                            context_line = f"*{indicator} context: ~{prompt_in:,} / {event.context_window:,} tokens ({context_pct:.1f}%)*"
                         else:
-                            indicator = "\U0001f7e2"   # green circle
-                            warning = ""
+                            context_line = f"*context: ~{prompt_in:,} tokens*"
 
-                        # Accumulate tokens for the session/feature
+                        # Accumulate cost for the session/feature
                         totals = self.bot.feature_manager.accumulate_tokens(
                             project_dir,
                             input_tokens=prompt_in,
@@ -261,7 +286,7 @@ class ClaudePromptCog(commands.Cog):
                             f"{model_str}"
                             f"{session_id_str}"
                             f"*this prompt: {prompt_in:,} in + {prompt_out:,} out = {prompt_total:,} tokens{cost_str}*\n"
-                            f"*{indicator} context: {prompt_in:,} / {event.context_window:,} tokens ({context_pct:.1f}%)*"
+                            f"{context_line}"
                             f"{session_line}"
                             f"{warning}"
                         )
