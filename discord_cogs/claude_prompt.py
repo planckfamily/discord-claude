@@ -391,6 +391,117 @@ class ClaudePromptCog(commands.Cog):
             except asyncio.CancelledError:
                 pass
 
+    async def _process_prompt(self, item: QueuedPrompt) -> None:
+        message = item.message
+        prompt = item.prompt
+        project = item.project
+        runner = self.bot.claude_runner
+
+        # Main channel queries run against the bot's own project directory
+        if project is None:
+            project_dir = Path(__file__).resolve().parent.parent
+        else:
+            project_dir = self.bot.project_manager.get_project_dir(project)
+
+        # Get session_id: prefer active feature's session, fall back to project default
+        feature = self.bot.feature_manager.get_current_feature(project_dir) if project else None
+        session_id = feature.session_id if feature else None
+        if not session_id:
+            from core.state import load_project_state
+            state = load_project_state(project_dir)
+            session_id = state.get("default_session_id")
+        resume = bool(session_id)
+
+        # Snapshot full diff state so we can detect any changes (committed or not)
+        is_self = self.bot.is_self_project(project_dir)
+        diff_snapshot = None
+        if is_self:
+            try:
+                diff_proc, head_proc = await asyncio.gather(
+                    asyncio.create_subprocess_exec(
+                        "git", "diff", "HEAD",
+                        cwd=str(project_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    ),
+                    asyncio.create_subprocess_exec(
+                        "git", "rev-parse", "HEAD",
+                        cwd=str(project_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    ),
+                )
+                diff_out, _ = await asyncio.wait_for(diff_proc.communicate(), timeout=5)
+                head_out, _ = await asyncio.wait_for(head_proc.communicate(), timeout=5)
+                diff_snapshot = (head_out.decode().strip(), diff_out.decode())
+            except Exception:
+                pass
+
+        print(f"\n{'='*60}\n[{message.author}] {prompt}\n{'='*60}", flush=True)
+
+        # Run the initial prompt
+        last_session_id, pending_question = await self._run_stream(
+            channel=message.channel,
+            runner=runner,
+            prompt=prompt,
+            project_dir=project_dir,
+            thread_id=message.channel.id,
+            session_id=session_id,
+            resume=resume,
+            feature=feature,
+        )
+
+        # Question loop: collect answer, continue session, repeat if needed
+        while pending_question and last_session_id:
+            answer = await self._collect_answer(message.channel, pending_question)
+            print(f"[Answer] {answer}", flush=True)
+
+            last_session_id, pending_question = await self._run_stream(
+                channel=message.channel,
+                runner=runner,
+                prompt=answer,
+                project_dir=project_dir,
+                thread_id=message.channel.id,
+                session_id=last_session_id,
+                resume=True,
+                feature=feature,
+            )
+
+        # Log to history
+        self.bot.feature_manager.add_history(
+            project_dir,
+            user=str(message.author),
+            prompt_summary=prompt,
+            feature_name=feature.name if feature else None,
+        )
+
+        # Auto-restart if the bot's own code was actually modified
+        if is_self and diff_snapshot is not None:
+            try:
+                old_head, old_diff = diff_snapshot
+                diff_proc, head_proc = await asyncio.gather(
+                    asyncio.create_subprocess_exec(
+                        "git", "diff", "HEAD",
+                        cwd=str(project_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    ),
+                    asyncio.create_subprocess_exec(
+                        "git", "rev-parse", "HEAD",
+                        cwd=str(project_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    ),
+                )
+                diff_out, _ = await asyncio.wait_for(diff_proc.communicate(), timeout=5)
+                head_out, _ = await asyncio.wait_for(head_proc.communicate(), timeout=5)
+                head = head_out.decode().strip()
+                uncommitted = diff_out.decode()
+                if head != old_head or uncommitted != old_diff:
+                    await self.bot.request_restart(channel=message.channel)
+            except Exception:
+                pass
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(ClaudePromptCog(bot))
