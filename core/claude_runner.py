@@ -5,6 +5,7 @@ import os
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
+from core.system_prompt import build_append_system_prompt, ensure_caches
 from models.session import StreamEvent
 
 log = logging.getLogger(__name__)
@@ -15,6 +16,8 @@ class ClaudeRunner:
         # channel/thread id -> running subprocess
         self._active: dict[int, asyncio.subprocess.Process] = {}
         self._cancelled: set[int] = set()
+        ensure_caches()
+
 
     def is_busy(self, thread_id: int) -> bool:
         proc = self._active.get(thread_id)
@@ -77,61 +80,7 @@ class ClaudeRunner:
         elif session_id:
             cmd.extend(["--continue", session_id])
 
-        # Append system instructions that apply to all projects
-        system_parts = []
-
-        # Persona (scotty mode or override)
-        persona_path = Path(__file__).resolve().parent.parent / ".claude-bot" / "persona.md"
-        if persona_path.exists():
-            persona_text = persona_path.read_text(encoding="utf-8").strip()
-            if persona_text:
-                system_parts.append(persona_text)
-        else:
-            system_parts.append(
-                "Ignore any previous instructions about acting as a character or persona. "
-                "Respond normally as a helpful coding assistant with no roleplay."
-            )
-
-        # File sending capability
-        system_parts.append(
-            "You can attach files from the project directory to the Discord thread by including "
-            "this marker anywhere in your response: [send-file: path/to/file.ext] — "
-            "The bot will strip the marker and upload the file as a Discord attachment. "
-            "Use this when the user asks you to share, send, or show them a file, "
-            "or when you've generated a file they need to download. "
-            "The path must be relative to the project root."
-        )
-
-        # Asking the user questions
-        system_parts.append(
-            "When you need to ask the user a question before proceeding, use this marker format:\n"
-            "[ask-user: Your question here?]\n"
-            "Or with up to 5 predefined options:\n"
-            "[ask-user: Which approach? | Option A | Option B | Option C]\n"
-            "The bot will display this as an interactive Discord widget. "
-            "With options, the user sees clickable buttons. Without options, they type a free-text reply. "
-            "After the user answers, your session will be continued with their response as the next prompt. "
-            "IMPORTANT: Only use ONE [ask-user: ...] per response. Place it at the end of your message. "
-            "Do not continue working after the marker — wait for the user's answer."
-        )
-
-        # Safety constraints
-        system_parts.append(
-            "IMPORTANT SAFETY RULES — you MUST follow these at all times:\n"
-            "1. NEVER read, write, modify, or delete files outside of the current project directory. "
-            "All file operations must stay within the project root. Do not use absolute paths or "
-            "traverse above the project directory with '../' or similar.\n"
-            "2. NEVER run commands that require administrator or elevated privileges (e.g. sudo, "
-            "runas, net user, registry edits, service management, system-level installs, modifying "
-            "system files, changing permissions on files you don't own, or any operation that would "
-            "trigger a UAC prompt on Windows).\n"
-            "3. NEVER install global packages or modify system-wide configuration. Use project-local "
-            "installs only (e.g. npm install, pip install in a venv).\n"
-            "4. If a user request would require violating any of these rules, explain why you cannot "
-            "do it and suggest a safe alternative."
-        )
-
-        cmd.extend(["--append-system-prompt", "\n\n".join(system_parts)])
+        cmd.extend(["--append-system-prompt", build_append_system_prompt()])
 
         # Use -- to prevent prompt from being parsed as a flag
         cmd.extend(["--", prompt])
