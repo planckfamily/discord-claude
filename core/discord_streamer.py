@@ -112,11 +112,18 @@ class DiscordStreamer:
         if len(content) > CHAR_LIMIT:
             content = content[:CHAR_LIMIT - 3] + "..."
         if self.current_message and not self.current_text:
+            # No streamed text yet — replace the placeholder message with the error
             try:
                 await self.current_message.edit(content=content, view=None)
             except discord.HTTPException:
                 await self.channel.send(content)
         else:
+            # Streamed text exists — remove the stop button from it, then send error separately
+            if self.current_message:
+                try:
+                    await self.current_message.edit(content=self.current_text, view=None)
+                except discord.HTTPException:
+                    pass
             await self.channel.send(content)
         self._cleanup_view()
 

@@ -100,10 +100,11 @@ class ClaudePromptCog(commands.Cog):
         if self.bot.user not in message.mentions:
             return
 
-        # Reject new prompts while a restart is pending
+        # Warn if a restart is pending, but still accept the prompt (it will delay the restart)
         if self.bot._restart_requested:
-            await message.channel.send("Restart in progress — not accepting new prompts.")
-            return
+            await message.channel.send(
+                "⚠️ A restart is scheduled — your prompt will delay it until this run completes."
+            )
 
         # Strip the bot mention from the prompt
         prompt = self._strip_mention(message.content)
@@ -220,9 +221,13 @@ class ClaudePromptCog(commands.Cog):
             # Notify the bot that a worker finished
             await self.bot.notify_worker_done()
 
-    async def _run_stream(self, *, channel, runner, prompt, project_dir, thread_id,
+    async def _run_stream(self, *, channel, runner, prompt, project_dir, run_dir, thread_id,
                           session_id, resume, feature) -> tuple[str | None, str | None]:
-        """Run Claude and stream to Discord. Returns (last_session_id, pending_question)."""
+        """Run Claude and stream to Discord. Returns (last_session_id, pending_question).
+
+        project_dir: project root — used for state, token tracking, file security
+        run_dir: Claude's working directory — may be a subdirectory when a feature targets one
+        """
         # Start streaming with a cancel button
         cancel_fn = lambda: runner.cancel(thread_id)
         streamer = DiscordStreamer(channel, on_cancel=cancel_fn)
@@ -241,7 +246,7 @@ class ClaudePromptCog(commands.Cog):
         try:
             async for event in runner.run(
                 prompt=prompt,
-                project_dir=project_dir,
+                project_dir=run_dir,
                 thread_id=thread_id,
                 session_id=session_id,
                 resume=resume,
@@ -356,7 +361,7 @@ class ClaudePromptCog(commands.Cog):
             # Attach any files that were referenced
             for rel_path in pending_files:
                 rel_path = rel_path.strip()
-                file_path = (project_dir / rel_path).resolve()
+                file_path = (run_dir / rel_path).resolve()
                 # Security: must be within project directory
                 try:
                     file_path.relative_to(project_dir.resolve())
@@ -391,6 +396,47 @@ class ClaudePromptCog(commands.Cog):
             except asyncio.CancelledError:
                 pass
 
+    async def run_feature_summary_prompt(self, channel, project, feature) -> None:
+        """Send a prompt to Claude to create a feature doc and update CLAUDE.md.
+        Called after a feature is marked complete. Always runs from the project root
+        so that CLAUDE.md resolves correctly regardless of subdir.
+        """
+        project_dir = self.bot.project_manager.get_project_dir(project)
+
+        # Feature doc lives under the subdir's own features/ folder, or the project root's
+        if feature.subdir:
+            feature_doc_path = f"{feature.subdir}/features/{feature.name}.md"
+        else:
+            feature_doc_path = f"features/{feature.name}.md"
+
+        prompt = (
+            f"The feature **`{feature.name}`** has just been marked as completed. "
+            f"Please do the following two tasks:\n\n"
+            f"1. Create `{feature_doc_path}` (relative to the project root) summarising this feature. Include:\n"
+            f"   - What the feature does / what problem it solves\n"
+            f"   - Key files changed or created\n"
+            f"   - Any important design decisions or tradeoffs\n"
+            f"   - Known limitations or follow-up items (if any)\n\n"
+            f"2. Open `CLAUDE.md` at the project root and add or update a `## Features` section "
+            f"that lists every feature with a one-sentence description and a reference to its doc file. "
+            f"Format each entry as a bullet:\n"
+            f"   - **{feature.name}**: One sentence description. See `{feature_doc_path}`.\n\n"
+            f"Do NOT use the @ symbol when referencing files in CLAUDE.md — write plain paths only. "
+            f"Preserve all existing content in CLAUDE.md outside the Features section. "
+            f"Keep both files concise."
+        )
+        await self._run_stream(
+            channel=channel,
+            runner=self.bot.claude_runner,
+            prompt=prompt,
+            project_dir=project_dir,
+            run_dir=project_dir,
+            thread_id=channel.id,
+            session_id=feature.session_id,
+            resume=True,
+            feature=feature,
+        )
+
     async def _process_prompt(self, item: QueuedPrompt) -> None:
         message = item.message
         prompt = item.prompt
@@ -411,6 +457,13 @@ class ClaudePromptCog(commands.Cog):
             state = load_project_state(project_dir)
             session_id = state.get("default_session_id")
         resume = bool(session_id)
+
+        # If the active feature targets a subdirectory, use that as Claude's working dir
+        run_dir = project_dir
+        if feature and feature.subdir:
+            candidate = project_dir / feature.subdir
+            if candidate.is_dir():
+                run_dir = candidate
 
         # Snapshot full diff state so we can detect any changes (committed or not)
         is_self = self.bot.is_self_project(project_dir)
@@ -445,6 +498,7 @@ class ClaudePromptCog(commands.Cog):
             runner=runner,
             prompt=prompt,
             project_dir=project_dir,
+            run_dir=run_dir,
             thread_id=message.channel.id,
             session_id=session_id,
             resume=resume,
@@ -461,6 +515,7 @@ class ClaudePromptCog(commands.Cog):
                 runner=runner,
                 prompt=answer,
                 project_dir=project_dir,
+                run_dir=run_dir,
                 thread_id=message.channel.id,
                 session_id=last_session_id,
                 resume=True,

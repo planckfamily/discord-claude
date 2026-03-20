@@ -78,7 +78,22 @@ _SAFETY_RULES = (
     "do it and suggest a safe alternative."
 )
 
-STATIC_SYSTEM_PROMPT = "\n\n".join([_FILE_SENDING, _ASK_USER, _SAFETY_RULES])
+_DISCORD_FORMATTING = (
+    "Your responses are displayed in Discord, which has limited markdown support. "
+    "Discord does NOT render markdown tables (pipes and dashes).\n\n"
+    "When you need to show tabular or aligned data, always use a monospace code block so columns line up correctly:\n"
+    "```\n"
+    "Key           Value\n"
+    "------------  ---------------\n"
+    "Branch        main\n"
+    "Tests         42 passing\n"
+    "Coverage      87%\n"
+    "```\n\n"
+    "Keep Discord's 2000-character message limit in mind — for large outputs, "
+    "consider summarizing or offering to send the full data as a file."
+)
+
+STATIC_SYSTEM_PROMPT = "\n\n".join([_FILE_SENDING, _ASK_USER, _SAFETY_RULES, _DISCORD_FORMATTING])
 
 # ---------------------------------------------------------------------------
 # Public API

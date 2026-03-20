@@ -25,7 +25,8 @@ class StatusCog(commands.Cog):
             lines = [f"**Status for `{project.name}`:**"]
             lines.append(f"- Claude: {'**running**' if is_busy else 'idle'}")
             if feature:
-                lines.append(f"- Active feature: `{feature.name}`")
+                scope = f" (in `{feature.subdir}/`)" if feature.subdir else ""
+                lines.append(f"- Active feature: `{feature.name}`{scope}")
                 lines.append(f"- Session: `{feature.session_id[:8]}...`")
             else:
                 lines.append("- No active feature")
@@ -61,7 +62,8 @@ class StatusCog(commands.Cog):
                 thread_id = project.thread_id
                 is_busy = self.bot.claude_runner.is_busy(thread_id) if thread_id else False
                 feature = self.bot.feature_manager.get_current_feature(pm.get_project_dir(project))
-                feat_str = f" | feature: `{feature.name}`" if feature else ""
+                subdir_str = f" in `{feature.subdir}/`" if feature and feature.subdir else ""
+                feat_str = f" | feature: `{feature.name}`{subdir_str}" if feature else ""
                 thread_link = f" (<#{thread_id}>)" if thread_id else ""
 
                 if is_busy:

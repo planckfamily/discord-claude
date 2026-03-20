@@ -7,7 +7,7 @@ from models.feature import Feature
 
 
 class FeatureManager:
-    def start_feature(self, project_dir: Path, name: str) -> Feature:
+    def start_feature(self, project_dir: Path, name: str, subdir: str | None = None) -> Feature:
         state = load_project_state(project_dir)
         features = state.get("features", {})
 
@@ -18,7 +18,7 @@ class FeatureManager:
 
         # Create the new feature
         session_id = str(uuid.uuid4())
-        feature = Feature(name=name, session_id=session_id)
+        feature = Feature(name=name, session_id=session_id, subdir=subdir)
         features[name] = feature.to_dict()
 
         state["features"] = features

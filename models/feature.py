@@ -8,13 +8,14 @@ class Feature:
     session_id: str
     started_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     status: str = "active"
+    subdir: str | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_cost_usd: float = 0.0
     prompt_count: int = 0
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "session_id": self.session_id,
             "started_at": self.started_at,
             "status": self.status,
@@ -23,6 +24,9 @@ class Feature:
             "total_cost_usd": self.total_cost_usd,
             "prompt_count": self.prompt_count,
         }
+        if self.subdir:
+            d["subdir"] = self.subdir
+        return d
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "Feature":
@@ -31,6 +35,7 @@ class Feature:
             session_id=data["session_id"],
             started_at=data.get("started_at", ""),
             status=data.get("status", "active"),
+            subdir=data.get("subdir"),
             total_input_tokens=data.get("total_input_tokens", 0),
             total_output_tokens=data.get("total_output_tokens", 0),
             total_cost_usd=data.get("total_cost_usd", 0.0),
