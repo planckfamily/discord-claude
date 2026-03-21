@@ -222,11 +222,12 @@ class ClaudePromptCog(commands.Cog):
             await self.bot.notify_worker_done()
 
     async def _run_stream(self, *, channel, runner, prompt, project_dir, run_dir, thread_id,
-                          session_id, resume, feature) -> tuple[str | None, str | None]:
+                          session_id, resume, feature, model=None) -> tuple[str | None, str | None]:
         """Run Claude and stream to Discord. Returns (last_session_id, pending_question).
 
         project_dir: project root — used for state, token tracking, file security
         run_dir: Claude's working directory — may be a subdirectory when a feature targets one
+        model: optional model override (e.g. 'claude-opus-4-6')
         """
         # Start streaming with a cancel button
         cancel_fn = lambda: runner.cancel(thread_id)
@@ -250,6 +251,7 @@ class ClaudePromptCog(commands.Cog):
                 thread_id=thread_id,
                 session_id=session_id,
                 resume=resume,
+                model=model,
             ):
                 if event.type == "text":
                     print(event.content, end="", flush=True)
@@ -450,13 +452,15 @@ class ClaudePromptCog(commands.Cog):
             project_dir = self.bot.project_manager.get_project_dir(project)
 
         # Get session_id: prefer active feature's session, fall back to project default
+        # Also read the preferred model for this project
         feature = self.bot.feature_manager.get_current_feature(project_dir) if project else None
         session_id = feature.session_id if feature else None
+        from core.state import load_project_state
+        state = load_project_state(project_dir)
         if not session_id:
-            from core.state import load_project_state
-            state = load_project_state(project_dir)
             session_id = state.get("default_session_id")
         resume = bool(session_id)
+        preferred_model = state.get("preferred_model")
 
         # If the active feature targets a subdirectory, use that as Claude's working dir
         run_dir = project_dir
@@ -503,6 +507,7 @@ class ClaudePromptCog(commands.Cog):
             session_id=session_id,
             resume=resume,
             feature=feature,
+            model=preferred_model,
         )
 
         # Question loop: collect answer, continue session, repeat if needed
@@ -520,6 +525,7 @@ class ClaudePromptCog(commands.Cog):
                 session_id=last_session_id,
                 resume=True,
                 feature=feature,
+                model=preferred_model,
             )
 
         # Log to history

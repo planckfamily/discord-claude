@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from pathlib import Path
 
 from core.system_prompt import ensure_caches, get_system_prompt_file
@@ -11,32 +13,46 @@ from models.session import StreamEvent
 log = logging.getLogger(__name__)
 
 
+@dataclass
+class ActiveRun:
+    process: asyncio.subprocess.Process
+    prompt: str
+    started_at: float  # time.monotonic()
+
+
 class ClaudeRunner:
     def __init__(self) -> None:
-        # channel/thread id -> running subprocess
-        self._active: dict[int, asyncio.subprocess.Process] = {}
+        # channel/thread id -> active run info
+        self._active: dict[int, ActiveRun] = {}
         self._cancelled: set[int] = set()
         ensure_caches()
 
 
     def is_busy(self, thread_id: int) -> bool:
-        proc = self._active.get(thread_id)
-        return proc is not None and proc.returncode is None
+        run = self._active.get(thread_id)
+        return run is not None and run.process.returncode is None
+
+    def get_active_info(self, thread_id: int) -> tuple[str, float] | None:
+        """Returns (prompt, elapsed_seconds) if a run is active, else None."""
+        run = self._active.get(thread_id)
+        if run and run.process.returncode is None:
+            return run.prompt, time.monotonic() - run.started_at
+        return None
 
     def cancel(self, thread_id: int) -> bool:
-        proc = self._active.get(thread_id)
-        if proc and proc.returncode is None:
+        run = self._active.get(thread_id)
+        if run and run.process.returncode is None:
             self._cancelled.add(thread_id)
-            proc.kill()
+            run.process.kill()
             return True
         return False
 
     async def cancel_all(self) -> None:
-        for thread_id, proc in list(self._active.items()):
-            if proc.returncode is None:
-                proc.kill()
+        for thread_id, run in list(self._active.items()):
+            if run.process.returncode is None:
+                run.process.kill()
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
+                    await asyncio.wait_for(run.process.wait(), timeout=5)
                 except asyncio.TimeoutError:
                     pass
         self._active.clear()
@@ -63,6 +79,7 @@ class ClaudeRunner:
         thread_id: int,
         session_id: str | None = None,
         resume: bool = False,
+        model: str | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         if self.is_busy(thread_id):
             yield StreamEvent(type="error", content="Claude is already running for this project.")
@@ -74,6 +91,9 @@ class ClaudeRunner:
             session_id = None
 
         cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"]
+
+        if model:
+            cmd.extend(["--model", model])
 
         if resume and session_id:
             cmd.extend(["--resume", session_id])
@@ -99,7 +119,7 @@ class ClaudeRunner:
                 stderr=asyncio.subprocess.PIPE,
             )
             log.info("Process started (PID %s)", proc.pid)
-            self._active[thread_id] = proc
+            self._active[thread_id] = ActiveRun(process=proc, prompt=prompt, started_at=time.monotonic())
 
             # Start draining stderr immediately
             stderr_task = asyncio.create_task(self._drain_stderr(proc))
@@ -124,7 +144,7 @@ class ClaudeRunner:
         finally:
             was_cancelled = thread_id in self._cancelled
             self._cancelled.discard(thread_id)
-            self._active.pop(thread_id, None)
+            self._active.pop(thread_id, None)  # ActiveRun removed regardless of how we exit
             if was_cancelled:
                 yield StreamEvent(type="cancelled")
 
