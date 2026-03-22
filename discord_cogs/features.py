@@ -1,7 +1,11 @@
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
 from pathlib import Path
+
+from core.bridgecrew_client import report_feature_completed, report_feature_started
+from core.state import load_project_state, save_project_state
 
 
 class SubdirSelect(discord.ui.Select):
@@ -27,6 +31,9 @@ class SubdirSelect(discord.ui.Select):
             ),
             view=None,
         )
+        cog = self.bot.cogs.get("FeaturesCog")
+        if cog:
+            asyncio.create_task(cog._report_feature_started(self.project_dir, feature))
 
 
 class SubdirView(discord.ui.View):
@@ -38,6 +45,43 @@ class SubdirView(discord.ui.View):
 class FeaturesCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    async def _report_feature_started(self, project_dir: Path, feature) -> None:
+        """Report feature start to myvillage API and persist the returned feature_id."""
+        state = load_project_state(project_dir)
+        myvillage_project_id = state.get("myvillage_project_id", "")
+        if not myvillage_project_id:
+            return
+        loop = asyncio.get_event_loop()
+        feature_id = await loop.run_in_executor(
+            None,
+            lambda: report_feature_started(
+                project_id=myvillage_project_id,
+                feature_name=feature.name,
+                session_id=feature.session_id,
+                subdir=feature.subdir or "",
+            ),
+        )
+        if feature_id and feature.name in state.get("features", {}):
+            state["features"][feature.name]["myvillage_feature_id"] = feature_id
+            save_project_state(project_dir, state)
+
+    async def _report_feature_completed(self, project_dir: Path, feature) -> None:
+        """Report feature completion to myvillage API."""
+        state = load_project_state(project_dir)
+        myvillage_feature_id = state.get("features", {}).get(feature.name, {}).get("myvillage_feature_id", "")
+        if not myvillage_feature_id:
+            return
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: report_feature_completed(
+                feature_id=myvillage_feature_id,
+                total_cost_usd=feature.total_cost_usd,
+                total_input_tokens=feature.total_input_tokens,
+                total_output_tokens=feature.total_output_tokens,
+            ),
+        )
 
     def _resolve_project(self, interaction: discord.Interaction):
         """Resolve the project from the thread context."""
@@ -82,6 +126,7 @@ class FeaturesCog(commands.Cog):
         else:
             # No subdirectories — start at project root directly
             feature = self.bot.feature_manager.start_feature(project_dir, name)
+            asyncio.create_task(self._report_feature_started(project_dir, feature))
             await interaction.response.send_message(
                 f"Feature **`{feature.name}`** started.\n"
                 f"Session ID: `{feature.session_id[:8]}...`"
@@ -131,9 +176,10 @@ class FeaturesCog(commands.Cog):
             f"Feature **`{feature.name}`** marked as completed. Generating feature summary..."
         )
 
+        asyncio.create_task(self._report_feature_completed(project_dir, feature))
+
         prompt_cog = self.bot.cogs.get("ClaudePromptCog")
         if prompt_cog and feature.session_id:
-            import asyncio
             asyncio.create_task(
                 prompt_cog.run_feature_summary_prompt(interaction.channel, project, feature)
             )

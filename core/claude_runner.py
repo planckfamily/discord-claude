@@ -5,7 +5,12 @@ import os
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
-from core.system_prompt import ensure_caches, get_system_prompt_file
+from core.system_prompt import (
+    cleanup_session_prompt,
+    ensure_caches,
+    get_system_prompt_file,
+    write_session_prompt,
+)
 from models.session import StreamEvent
 
 log = logging.getLogger(__name__)
@@ -63,6 +68,7 @@ class ClaudeRunner:
         thread_id: int,
         session_id: str | None = None,
         resume: bool = False,
+        persona_content: str = "",
     ) -> AsyncGenerator[StreamEvent, None]:
         if self.is_busy(thread_id):
             yield StreamEvent(type="error", content="Claude is already running for this project.")
@@ -80,7 +86,12 @@ class ClaudeRunner:
         elif session_id:
             cmd.extend(["--continue", session_id])
 
-        cmd.extend(["--append-system-prompt-file", str(get_system_prompt_file())])
+        # Use a per-session prompt file if a persona is provided, otherwise fall back to global
+        if persona_content:
+            session_prompt_file = write_session_prompt(thread_id, persona_content)
+            cmd.extend(["--append-system-prompt-file", str(session_prompt_file)])
+        else:
+            cmd.extend(["--append-system-prompt-file", str(get_system_prompt_file())])
 
         # Use -- to prevent prompt from being parsed as a flag
         cmd.extend(["--", prompt])
@@ -125,6 +136,9 @@ class ClaudeRunner:
             was_cancelled = thread_id in self._cancelled
             self._cancelled.discard(thread_id)
             self._active.pop(thread_id, None)
+            # Clean up per-session prompt file if one was written
+            if persona_content:
+                cleanup_session_prompt(thread_id)
             if was_cancelled:
                 yield StreamEvent(type="cancelled")
 

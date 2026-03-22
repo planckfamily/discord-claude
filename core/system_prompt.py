@@ -126,3 +126,38 @@ def ensure_caches() -> None:
 def get_system_prompt_file() -> Path:
     """Return the path to the combined system prompt file for --append-system-prompt-file."""
     return _COMBINED_PATH
+
+
+# ---------------------------------------------------------------------------
+# Per-session prompt files (support multiple simultaneous sessions with
+# different personas)
+# ---------------------------------------------------------------------------
+
+_SESSIONS_DIR = _CACHE_DIR / "sessions"
+
+
+def write_session_prompt(thread_id: int, persona_content: str) -> Path:
+    """
+    Write a per-session combined prompt file and return its path.
+
+    Each concurrent session (Discord thread) can have a different persona.
+    The file is written to .claude-bot/sessions/{thread_id}/append_system_prompt.md.
+    """
+    session_dir = _SESSIONS_DIR / str(thread_id)
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    static = _STATIC_CACHE_PATH.read_text(encoding="utf-8") if _STATIC_CACHE_PATH.exists() else STATIC_SYSTEM_PROMPT
+    persona = persona_content.strip() if persona_content.strip() else NO_PERSONA
+    combined = "\n\n".join([persona, static])
+
+    session_file = session_dir / "append_system_prompt.md"
+    session_file.write_text(combined, encoding="utf-8")
+    return session_file
+
+
+def cleanup_session_prompt(thread_id: int) -> None:
+    """Remove the per-session prompt file when a session ends."""
+    import shutil
+    session_dir = _SESSIONS_DIR / str(thread_id)
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
