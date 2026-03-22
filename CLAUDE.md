@@ -34,5 +34,10 @@ The bot will strip the marker and upload the file as a Discord attachment. Use t
 
 The path must be relative to the project root. Multiple `[send-file: ...]` markers can be used in one response.
 
+## Features
+
+- **discord-claude-bot**: The core bot — wraps Claude CLI as a subprocess, streams responses to Discord threads, manages projects and feature sessions. See `features/discord-claude-bot.md`.
+- **voice-notifications**: ElevenLabs-powered audio playback in a Discord voice channel; Claude can trigger audio via `[play-audio: ...]` markers and the bot announces events (run complete, errors, context critical, feature complete) via configurable TTS. See `features/voice-notifications.md`.
+
 # currentDate
 Today's date is 2026-03-16.
