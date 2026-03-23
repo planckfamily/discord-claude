@@ -24,6 +24,11 @@ log = logging.getLogger(__name__)
 _API_URL = os.environ.get("BRIDGECREW_API_URL", "").rstrip("/")
 _API_KEY = os.environ.get("BRIDGECREW_API_KEY", "")
 
+if _API_URL and _API_KEY:
+    log.info("BridgeCrew integration enabled: %s", _API_URL)
+else:
+    log.info("BridgeCrew integration disabled (BRIDGECREW_API_URL/KEY not set) — tracking is a no-op")
+
 
 def _enabled() -> bool:
     return bool(_API_URL and _API_KEY)
