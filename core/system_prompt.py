@@ -65,9 +65,13 @@ _ASK_USER = (
 
 _SAFETY_RULES = (
     "IMPORTANT SAFETY RULES — you MUST follow these at all times:\n"
-    "1. NEVER read, write, modify, or delete files outside of the current project directory. "
-    "All file operations must stay within the project root. Do not use absolute paths or "
-    "traverse above the project directory with '../' or similar.\n"
+    "1. You may access files within the current project directory AND any other project "
+    "directory listed in the workspace context below. You may also read and modify global "
+    "Claude configuration files under the user's ~/.claude/ directory. Do NOT access files "
+    "outside of these allowed locations. You must NEVER access or modify any files outside "
+    "of the listed project directories and the global Claude config directory — no exceptions. "
+    "This includes the workspace root itself, other users' home directories, system files, "
+    "and any path not explicitly listed.\n"
     "2. NEVER run commands that require administrator or elevated privileges (e.g. sudo, "
     "runas, net user, registry edits, service management, system-level installs, modifying "
     "system files, changing permissions on files you don't own, or any operation that would "

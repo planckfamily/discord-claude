@@ -4,12 +4,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from discord_cogs import captains_only
+
 
 class ProjectsCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
     @app_commands.command(name="projects", description="List all discovered projects")
+    @captains_only()
     async def projects(self, interaction: discord.Interaction) -> None:
         pm = self.bot.project_manager
         projects = pm.projects
@@ -30,6 +33,7 @@ class ProjectsCog(commands.Cog):
         await interaction.response.send_message("\n".join(lines))
 
     @app_commands.command(name="sync-projects", description="Scan workspace and sync project threads")
+    @captains_only()
     async def sync_projects(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
         pm = self.bot.project_manager
@@ -50,6 +54,7 @@ class ProjectsCog(commands.Cog):
         await interaction.followup.send("\n".join(lines))
 
 
+    @captains_only()
     @app_commands.command(name="create-project", description="Create a new project directory with a CLAUDE.md and sync it")
     @app_commands.describe(
         name="Project name (used as directory name)",

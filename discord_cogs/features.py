@@ -3,6 +3,8 @@ from discord import app_commands
 from discord.ext import commands
 from pathlib import Path
 
+from discord_cogs import captains_only
+
 
 class SubdirSelect(discord.ui.Select):
     """Dropdown for picking a subdirectory (or project root)."""
@@ -99,6 +101,7 @@ class FeaturesCog(commands.Cog):
                 subdirs.append(p.name)
         return subdirs
 
+    @captains_only()
     @app_commands.command(name="start-feature", description="Start a new feature with a fresh Claude session")
     @app_commands.describe(name="Feature name (descriptive, e.g. 'add-auth-system')")
     async def start_feature(self, interaction: discord.Interaction, name: str) -> None:
@@ -124,6 +127,7 @@ class FeaturesCog(commands.Cog):
             )
 
     @app_commands.command(name="resume-feature", description="Resume an existing or completed feature")
+    @captains_only()
     async def resume_feature(self, interaction: discord.Interaction) -> None:
         project, project_dir = self._resolve_project(interaction)
         if not project:
@@ -138,6 +142,7 @@ class FeaturesCog(commands.Cog):
         view = FeatureView(features, project_dir, self.bot)
         await interaction.response.send_message("Pick a feature to resume:", view=view, ephemeral=True)
 
+    @captains_only()
     @app_commands.command(name="complete-feature", description="Mark a feature as completed")
     @app_commands.describe(name="Feature name to complete (defaults to current active feature)")
     async def complete_feature(self, interaction: discord.Interaction, name: str | None = None) -> None:
@@ -172,6 +177,7 @@ class FeaturesCog(commands.Cog):
             ))
 
     @app_commands.command(name="list-features", description="List all features for this project")
+    @captains_only()
     async def list_features(self, interaction: discord.Interaction) -> None:
         project, project_dir = self._resolve_project(interaction)
         if not project:

@@ -5,11 +5,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from discord_cogs import captains_only
+
 
 class VoiceCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+    @captains_only()
     @app_commands.command(name="voice-events", description="Toggle which bot events trigger voice notifications")
     @app_commands.describe(event="Event to toggle on/off")
     @app_commands.choices(event=[
@@ -33,6 +36,7 @@ class VoiceCog(commands.Cog):
         await interaction.response.send_message(f"**{event.name}** voice notifications {state}.")
 
     @app_commands.command(name="voice-test", description="Play a test notification in the configured voice channel")
+    @captains_only()
     async def voice_test(self, interaction: discord.Interaction) -> None:
         if not os.getenv("NOTIFY_VOICE_CHANNEL_ID"):
             await interaction.response.send_message(
@@ -51,6 +55,7 @@ class VoiceCog(commands.Cog):
         )
 
     @app_commands.command(name="voice-status", description="Show current voice notification configuration")
+    @captains_only()
     async def voice_status(self, interaction: discord.Interaction) -> None:
         from core.state import load_config
         config = load_config()

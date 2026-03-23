@@ -51,6 +51,7 @@ class ClaudeBot(commands.Bot):
         self.claude_runner = ClaudeRunner()
         self.feature_manager = FeatureManager()
         self.voice_notifier = VoiceNotifier(self)
+        self.workspace_dir = Path(WORKSPACE_DIR)
         self.project_manager = ProjectManager(
             workspace_dir=WORKSPACE_DIR,
             guild_id=int(GUILD_ID),

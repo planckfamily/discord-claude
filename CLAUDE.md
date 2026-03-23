@@ -38,6 +38,7 @@ The path must be relative to the project root. Multiple `[send-file: ...]` marke
 
 - **discord-claude-bot**: The core bot — wraps Claude CLI as a subprocess, streams responses to Discord threads, manages projects and feature sessions. See `features/discord-claude-bot.md`.
 - **voice-notifications**: ElevenLabs-powered audio playback in a Discord voice channel; Claude can trigger audio via `[play-audio: ...]` markers and the bot announces events (run complete, errors, context critical, feature complete) via configurable TTS. See `features/voice-notifications.md`.
+- **protections**: Role-based access control (captains role only) for all @mention prompts and slash commands, plus cross-project file access with explicit safety boundaries. See `features/protections.md`.
 
 # currentDate
 Today's date is 2026-03-16.
