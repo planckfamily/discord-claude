@@ -11,6 +11,7 @@ from core.discord_streamer import DiscordStreamer
 
 SEND_FILE_PATTERN = re.compile(r"\[send-file:\s*(.+?)\]")
 ASK_USER_PATTERN = re.compile(r"\[ask-user:\s*(.+?)\]")
+PLAY_AUDIO_PATTERN = re.compile(r"\[play-audio:\s*(.+?)\]", re.DOTALL)
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +53,99 @@ class AskUserView(discord.ui.View):
     async def on_timeout(self) -> None:
         self.answer = None
         self.event.set()
+
+
+BUGS_AND_FIXES = "Bugs & Fixes"
+
+
+class FeatureGateSelect(discord.ui.Select):
+    """Dropdown shown when a prompt arrives with no active feature."""
+
+    def __init__(self, features: list, project_dir, bot):
+        options = []
+        # Always offer Bugs & Fixes first
+        bugs_exists = any(f.name == BUGS_AND_FIXES for f in features)
+        bugs_desc = "Resume" if bugs_exists else "Create"
+        options.append(discord.SelectOption(
+            label=BUGS_AND_FIXES, value=BUGS_AND_FIXES,
+            description=f"{bugs_desc} — catch-all for misc work",
+        ))
+        # Existing features (skip Bugs & Fixes since it's already listed)
+        for f in features[:23]:
+            if f.name == BUGS_AND_FIXES:
+                continue
+            desc = f"{f.status}"
+            if f.subdir:
+                desc += f" · {f.subdir}/"
+            options.append(discord.SelectOption(label=f.name, value=f.name, description=desc))
+        # Option to create a new feature
+        options.append(discord.SelectOption(
+            label="Create new feature...", value="__new__",
+            description="Type a name for a new feature",
+        ))
+        super().__init__(placeholder="Select a feature before continuing...", options=options)
+        self.project_dir = project_dir
+        self.bot = bot
+        self.selected_feature = None
+        self.event = asyncio.Event()
+
+    async def callback(self, interaction: discord.Interaction):
+        choice = self.values[0]
+        fm = self.bot.feature_manager
+
+        if choice == "__new__":
+            # Send a modal to collect the feature name
+            modal = NewFeatureModal(self)
+            await interaction.response.send_modal(modal)
+            return
+
+        # Resume or create Bugs & Fixes / existing feature
+        existing = fm.list_features(self.project_dir)
+        exists = any(f.name == choice for f in existing)
+
+        if exists:
+            self.selected_feature = fm.resume_feature(self.project_dir, choice)
+        else:
+            self.selected_feature = fm.start_feature(self.project_dir, choice)
+
+        scope = f" in `{self.selected_feature.subdir}/`" if self.selected_feature.subdir else ""
+        action = "Resumed" if exists else "Started"
+        await interaction.response.edit_message(
+            content=f"{action} feature **`{self.selected_feature.name}`**{scope}. Processing prompt...",
+            view=None,
+        )
+        self.event.set()
+
+
+class NewFeatureModal(discord.ui.Modal, title="New Feature"):
+    name_input = discord.ui.TextInput(label="Feature name", placeholder="e.g. add-auth-system", max_length=80)
+
+    def __init__(self, gate_select: FeatureGateSelect):
+        super().__init__()
+        self.gate_select = gate_select
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.name_input.value.strip()
+        if not name:
+            await interaction.response.send_message("Feature name cannot be empty.", ephemeral=True)
+            return
+        fm = self.gate_select.bot.feature_manager
+        self.gate_select.selected_feature = fm.start_feature(self.gate_select.project_dir, name)
+        await interaction.response.edit_message(
+            content=f"Started feature **`{name}`**. Processing prompt...",
+            view=None,
+        )
+        self.gate_select.event.set()
+
+
+class FeatureGateView(discord.ui.View):
+    def __init__(self, features: list, project_dir, bot):
+        super().__init__(timeout=120)
+        self.select = FeatureGateSelect(features, project_dir, bot)
+        self.add_item(self.select)
+
+    async def on_timeout(self):
+        self.select.event.set()
 
 
 @dataclass
@@ -223,11 +317,14 @@ class ClaudePromptCog(commands.Cog):
 
     async def _run_stream(self, *, channel, runner, prompt, project_dir, run_dir, thread_id,
                           session_id, resume, feature, persona_content="",
-                          myvillage_project_id="") -> tuple[str | None, str | None, str]:
+                          myvillage_project_id="", model=None,
+                          guild=None, project_name=None) -> tuple[str | None, str | None, str]:
         """Run Claude and stream to Discord. Returns (last_session_id, pending_question, response_text).
 
         project_dir: project root — used for state, token tracking, file security
         run_dir: Claude's working directory — may be a subdirectory when a feature targets one
+        model: optional model override (e.g. 'claude-opus-4-6')
+        guild/project_name: used for autonomous voice notifications
         """
         # Start streaming with a cancel button
         cancel_fn = lambda: runner.cancel(thread_id)
@@ -255,6 +352,7 @@ class ClaudePromptCog(commands.Cog):
                 session_id=session_id,
                 resume=resume,
                 persona_content=persona_content,
+                model=model,
             ):
                 if event.type == "text":
                     print(event.content, end="", flush=True)
@@ -267,6 +365,11 @@ class ClaudePromptCog(commands.Cog):
                 elif event.type == "error":
                     print(f"\n[Error] {event.content}", flush=True)
                     await streamer.send_error(event.content)
+                    if guild:
+                        asyncio.create_task(self.bot.voice_notifier.voice_event(
+                            guild, "error",
+                            f"Claude hit an error in {project_name}." if project_name else "Claude hit an error."
+                        ))
                     return last_session_id, None, ""
                 elif event.type == "result":
                     if event.session_id:
@@ -274,51 +377,60 @@ class ClaudePromptCog(commands.Cog):
                     print(flush=True)  # final newline after streaming
                     # Persist session_id and model
                     if event.session_id or event.model:
-                        from core.state import load_project_state, save_project_state
+                        from core.state import load_project_state, save_project_state, load_feature_state, save_feature_state
 
+                        if event.session_id and feature:
+                            feat_state = load_feature_state(project_dir)
+                            if feature.name in feat_state.get("features", {}):
+                                feat_state["features"][feature.name]["session_id"] = event.session_id
+                                save_feature_state(project_dir, feat_state)
+
+                        # Save project-level defaults (bot state)
                         state = load_project_state(project_dir)
                         if event.session_id:
-                            # Save to feature if active
-                            if feature and feature.name in state.get("features", {}):
-                                state["features"][feature.name]["session_id"] = event.session_id
-                            # Always save as project default
                             state["default_session_id"] = event.session_id
                         if event.model:
                             state["model"] = event.model
                         save_project_state(project_dir, state)
 
-                    # Show per-prompt usage, context window, and session totals
+                    # Show context health and cost footer
                     if event.input_tokens is not None:
-                        prompt_in = event.input_tokens
-                        prompt_out = event.output_tokens or 0
-                        prompt_total = prompt_in + prompt_out
-                        cost_str = f" | ${event.cost_usd:.4f}" if event.cost_usd else ""
+                        context_fill = event.input_tokens
+                        context_window = event.context_window or 200_000
+                        # CLI may report 200k but newer models support 1M
+                        if event.model and ("opus" in event.model or "sonnet" in event.model):
+                            context_window = max(context_window, 1_000_000)
+                        context_pct = context_fill / context_window * 100
 
-                        # Context health indicator (only if we know the window size)
-                        context_line = ""
-                        warning = ""
-                        if event.context_window:
-                            context_pct = prompt_in / event.context_window * 100
-                            if context_pct >= 85:
-                                indicator = "\U0001f534"   # red circle
-                                warning = "\n**\u26a0\ufe0f Context window critically full — wrap up this feature now!**"
-                            elif context_pct >= 70:
-                                indicator = "\U0001f7e0"   # orange circle
-                                warning = "\n**\u26a0\ufe0f Context window getting large — consider finishing soon.**"
-                            elif context_pct >= 50:
-                                indicator = "\U0001f7e1"   # yellow circle
-                                warning = "\n*Context window over 50% — keep an eye on it.*"
-                            else:
-                                indicator = "\U0001f7e2"   # green circle
-                            context_line = f"*{indicator} context: ~{prompt_in:,} / {event.context_window:,} tokens ({context_pct:.1f}%)*"
+                        if context_pct >= 85:
+                            indicator = "\U0001f534"  # red
+                            warning = "\n**\u26a0\ufe0f Context window critically full — wrap up this feature now!**"
+                            if guild:
+                                asyncio.create_task(self.bot.voice_notifier.voice_event(
+                                    guild, "context_critical",
+                                    f"Context window critically full for {project_name}. Wrap up soon." if project_name
+                                    else "Context window critically full. Wrap up soon."
+                                ))
+                        elif context_pct >= 70:
+                            indicator = "\U0001f7e0"  # orange
+                            warning = "\n**\u26a0\ufe0f Context window getting large — consider finishing soon.**"
+                        elif context_pct >= 50:
+                            indicator = "\U0001f7e1"  # yellow
+                            warning = "\n*Context window over 50% — keep an eye on it.*"
                         else:
-                            context_line = f"*context: ~{prompt_in:,} tokens*"
+                            indicator = "\U0001f7e2"  # green
+                            warning = ""
+
+                        cost_str = f" · ${event.cost_usd:.4f}" if event.cost_usd else ""
+                        model_str = f" · `{event.model}`" if event.model else ""
+                        session_id_str = f" · session `{last_session_id[:8]}`" if last_session_id else ""
+                        context_line = f"*{indicator} {context_fill:,} / {context_window:,} tokens ({context_pct:.1f}%){cost_str}{model_str}{session_id_str}*"
 
                         # Accumulate cost for the session/feature
                         totals = self.bot.feature_manager.accumulate_tokens(
                             project_dir,
-                            input_tokens=prompt_in,
-                            output_tokens=prompt_out,
+                            input_tokens=context_fill,
+                            output_tokens=event.output_tokens or 0,
                             cost_usd=event.cost_usd or 0.0,
                             feature_name=feature.name if feature else None,
                         )
@@ -343,19 +455,12 @@ class ClaudePromptCog(commands.Cog):
                                 ),
                             )
                         session_label = f"feature `{feature.name}`" if feature else "session"
-
-                        model_str = f"*model: `{event.model}`*\n" if event.model else ""
-                        session_id_str = f"*session: `{event.session_id}`*\n" if event.session_id else ""
-
                         session_line = ""
                         if totals["total_cost_usd"]:
                             session_line = f"\n*{session_label}: ${totals['total_cost_usd']:.4f} across {totals['prompt_count']} prompt(s)*"
 
                         await streamer.feed(
                             f"\n\n---\n"
-                            f"{model_str}"
-                            f"{session_id_str}"
-                            f"*this prompt: {prompt_in:,} in + {prompt_out:,} out = {prompt_total:,} tokens{cost_str}*\n"
                             f"{context_line}"
                             f"{session_line}"
                             f"{warning}"
@@ -363,25 +468,41 @@ class ClaudePromptCog(commands.Cog):
 
             await streamer.finalize()
 
+            # Autonomous run-complete notification
+            if guild:
+                asyncio.create_task(self.bot.voice_notifier.voice_event(
+                    guild, "run_complete",
+                    f"Claude has finished in {project_name}." if project_name else "Claude has finished."
+                ))
+
             # Extract markers from the full response text and clean them from Discord messages
             response_text = "".join(full_response)
             pending_files = SEND_FILE_PATTERN.findall(response_text)
+            pending_audio = PLAY_AUDIO_PATTERN.findall(response_text)
             pending_question = None
             ask_match = ASK_USER_PATTERN.search(response_text)
             if ask_match:
                 pending_question = ask_match.group(1)
 
             # Strip markers from the Discord messages if any were found
-            if pending_files or pending_question:
+            if pending_files or pending_question or pending_audio:
                 for msg in streamer.all_messages:
                     try:
                         if msg.content:
                             cleaned = SEND_FILE_PATTERN.sub("", msg.content)
                             cleaned = ASK_USER_PATTERN.sub("", cleaned)
+                            cleaned = PLAY_AUDIO_PATTERN.sub("", cleaned)
                             if cleaned != msg.content:
                                 await msg.edit(content=cleaned.strip() or "\u200b")
                     except discord.HTTPException:
                         pass
+
+            # Fire [play-audio:] prompts as background tasks
+            for audio_prompt in pending_audio:
+                if guild:
+                    asyncio.create_task(
+                        self.bot.voice_notifier.play_prompt(guild, audio_prompt.strip())
+                    )
 
             # Attach any files that were referenced
             for rel_path in pending_files:
@@ -476,13 +597,30 @@ class ClaudePromptCog(commands.Cog):
             project_dir = self.bot.project_manager.get_project_dir(project)
 
         # Get session_id: prefer active feature's session, fall back to project default
+        # Also read the preferred model for this project
         feature = self.bot.feature_manager.get_current_feature(project_dir) if project else None
+
+        # Gate: require a feature selection for project threads
+        if project and not feature:
+            features = self.bot.feature_manager.list_features(project_dir)
+            view = FeatureGateView(features, project_dir, self.bot)
+            gate_msg = await message.channel.send(
+                "No active feature — pick one before I start working:",
+                view=view,
+            )
+            await view.select.event.wait()
+            feature = view.select.selected_feature
+            if not feature:
+                await gate_msg.edit(content="*Timed out — prompt cancelled.*", view=None)
+                return
+
         session_id = feature.session_id if feature else None
         from core.state import load_project_state
         state = load_project_state(project_dir)
         if not session_id:
             session_id = state.get("default_session_id")
         resume = bool(session_id)
+        preferred_model = state.get("preferred_model")
 
         # Fetch persona content and myvillage project ID
         myvillage_project_id = state.get("myvillage_project_id", "")
@@ -537,6 +675,9 @@ class ClaudePromptCog(commands.Cog):
 
         print(f"\n{'='*60}\n[{message.author}] {prompt}\n{'='*60}", flush=True)
 
+        guild = message.guild
+        project_name = project.name if project else None
+
         # Run the initial prompt
         last_session_id, pending_question, response_text = await self._run_stream(
             channel=message.channel,
@@ -550,6 +691,9 @@ class ClaudePromptCog(commands.Cog):
             feature=feature,
             persona_content=persona_content,
             myvillage_project_id=myvillage_project_id,
+            model=preferred_model,
+            guild=guild,
+            project_name=project_name,
         )
 
         # Report Claude's response to the activity feed (fire-and-forget)
@@ -583,6 +727,9 @@ class ClaudePromptCog(commands.Cog):
                 feature=feature,
                 persona_content=persona_content,
                 myvillage_project_id=myvillage_project_id,
+                model=preferred_model,
+                guild=guild,
+                project_name=project_name,
             )
 
         # Log to history

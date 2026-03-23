@@ -116,8 +116,7 @@ def write_persona(text: str) -> None:
 def ensure_caches() -> None:
     """Write cache files to disk if they don't already exist. Call once at startup."""
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    if not _STATIC_CACHE_PATH.exists():
-        _STATIC_CACHE_PATH.write_text(STATIC_SYSTEM_PROMPT, encoding="utf-8")
+    _STATIC_CACHE_PATH.write_text(STATIC_SYSTEM_PROMPT, encoding="utf-8")
     if not PERSONA_PATH.exists():
         PERSONA_PATH.write_text(NO_PERSONA, encoding="utf-8")
     _rebuild_combined()

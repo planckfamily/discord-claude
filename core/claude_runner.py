@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from pathlib import Path
 
 from core.system_prompt import (
@@ -16,32 +18,46 @@ from models.session import StreamEvent
 log = logging.getLogger(__name__)
 
 
+@dataclass
+class ActiveRun:
+    process: asyncio.subprocess.Process
+    prompt: str
+    started_at: float  # time.monotonic()
+
+
 class ClaudeRunner:
     def __init__(self) -> None:
-        # channel/thread id -> running subprocess
-        self._active: dict[int, asyncio.subprocess.Process] = {}
+        # channel/thread id -> active run info
+        self._active: dict[int, ActiveRun] = {}
         self._cancelled: set[int] = set()
         ensure_caches()
 
 
     def is_busy(self, thread_id: int) -> bool:
-        proc = self._active.get(thread_id)
-        return proc is not None and proc.returncode is None
+        run = self._active.get(thread_id)
+        return run is not None and run.process.returncode is None
+
+    def get_active_info(self, thread_id: int) -> tuple[str, float] | None:
+        """Returns (prompt, elapsed_seconds) if a run is active, else None."""
+        run = self._active.get(thread_id)
+        if run and run.process.returncode is None:
+            return run.prompt, time.monotonic() - run.started_at
+        return None
 
     def cancel(self, thread_id: int) -> bool:
-        proc = self._active.get(thread_id)
-        if proc and proc.returncode is None:
+        run = self._active.get(thread_id)
+        if run and run.process.returncode is None:
             self._cancelled.add(thread_id)
-            proc.kill()
+            run.process.kill()
             return True
         return False
 
     async def cancel_all(self) -> None:
-        for thread_id, proc in list(self._active.items()):
-            if proc.returncode is None:
-                proc.kill()
+        for thread_id, run in list(self._active.items()):
+            if run.process.returncode is None:
+                run.process.kill()
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
+                    await asyncio.wait_for(run.process.wait(), timeout=5)
                 except asyncio.TimeoutError:
                     pass
         self._active.clear()
@@ -69,6 +85,7 @@ class ClaudeRunner:
         session_id: str | None = None,
         resume: bool = False,
         persona_content: str = "",
+        model: str | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         if self.is_busy(thread_id):
             yield StreamEvent(type="error", content="Claude is already running for this project.")
@@ -80,6 +97,9 @@ class ClaudeRunner:
             session_id = None
 
         cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json", "--dangerously-skip-permissions"]
+
+        if model:
+            cmd.extend(["--model", model])
 
         if resume and session_id:
             cmd.extend(["--resume", session_id])
@@ -110,7 +130,7 @@ class ClaudeRunner:
                 stderr=asyncio.subprocess.PIPE,
             )
             log.info("Process started (PID %s)", proc.pid)
-            self._active[thread_id] = proc
+            self._active[thread_id] = ActiveRun(process=proc, prompt=prompt, started_at=time.monotonic())
 
             # Start draining stderr immediately
             stderr_task = asyncio.create_task(self._drain_stderr(proc))
@@ -162,6 +182,11 @@ class ClaudeRunner:
 
         buffer = b""
         has_emitted_text = False
+        # Tracks the input token count from the most recent assistant turn.
+        # Each assistant event from the CLI contains message.usage with per-call
+        # token counts. The last one is the true context-window fill at completion.
+        last_turn_input = 0
+
         while True:
             chunk = await proc.stdout.read(4096)
             if not chunk:
@@ -176,23 +201,39 @@ class ClaudeRunner:
                 line = line.strip()
                 if not line:
                     continue
-                for event in self._parse_line(line, has_emitted_text):
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    log.warning("Skipping malformed JSON line: %s", line[:200])
+                    continue
+
+                # Update last_turn_input from each assistant message's per-call usage.
+                # This is more accurate than dividing aggregate totals by num_turns.
+                if data.get("type") == "assistant":
+                    usage = data.get("message", {}).get("usage", {})
+                    if usage:
+                        last_turn_input = (
+                            usage.get("input_tokens", 0)
+                            + usage.get("cache_read_input_tokens", 0)
+                            + usage.get("cache_creation_input_tokens", 0)
+                        )
+
+                for event in self._parse_line(data, has_emitted_text, last_turn_input):
                     if event.type == "text" and event.content.strip():
                         has_emitted_text = True
                     yield event
 
         # Process any remaining buffer
         if buffer.strip():
-            for event in self._parse_line(buffer.strip(), has_emitted_text):
+            try:
+                data = json.loads(buffer.strip())
+            except json.JSONDecodeError:
+                log.warning("Skipping malformed JSON line: %s", buffer[:200])
+                return
+            for event in self._parse_line(data, has_emitted_text, last_turn_input):
                 yield event
 
-    def _parse_line(self, line: bytes, has_emitted_text: bool = False) -> list[StreamEvent]:
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            log.warning("Skipping malformed JSON line: %s", line[:200])
-            return []
-
+    def _parse_line(self, data: dict, has_emitted_text: bool = False, last_turn_input: int = 0) -> list[StreamEvent]:
         msg_type = data.get("type", "")
 
         # Handle assistant messages (CLI stream-json format)
@@ -233,29 +274,24 @@ class ClaudeRunner:
 
             result = data.get("result", "")
 
-            # modelUsage aggregates across all API turns in the invocation.
-            # For context-window fill we want the LAST turn's input tokens,
-            # which is roughly total / num_turns for multi-turn (tool-use) calls.
-            total_in = (usage.get("inputTokens", 0)
-                        + usage.get("cacheReadInputTokens", 0)
-                        + usage.get("cacheCreationInputTokens", 0)) if usage else None
-
-            # Estimate last-turn context size for multi-turn invocations
-            if total_in and num_turns > 1:
-                # Each successive turn is slightly larger than the last, but
-                # dividing gives a reasonable lower-bound estimate.
-                estimated_context = total_in // num_turns
+            # last_turn_input is tracked in _parse_stream from each assistant message's
+            # per-call usage — this is the accurate context fill at the final turn.
+            # Fall back to total aggregate only if we never saw an assistant message.
+            if last_turn_input:
+                context_fill = last_turn_input
             else:
-                estimated_context = total_in
+                context_fill = (usage.get("inputTokens", 0)
+                                + usage.get("cacheReadInputTokens", 0)
+                                + usage.get("cacheCreationInputTokens", 0)) if usage else None
 
             # context_window: try modelUsage first, fall back to known defaults
             context_window = usage.get("contextWindow") if usage else None
             if not context_window and model_name:
                 # Sensible defaults for known model families
                 if "opus" in model_name:
-                    context_window = 200000
+                    context_window = 1000000
                 elif "sonnet" in model_name:
-                    context_window = 200000
+                    context_window = 1000000
                 elif "haiku" in model_name:
                     context_window = 200000
 
@@ -264,7 +300,7 @@ class ClaudeRunner:
                 content=result if isinstance(result, str) else "",
                 session_id=data.get("session_id"),
                 cost_usd=float(cost_raw) if cost_raw is not None else None,
-                input_tokens=estimated_context,
+                input_tokens=context_fill,
                 output_tokens=usage.get("outputTokens") if usage else None,
                 context_window=context_window,
                 model=model_name,

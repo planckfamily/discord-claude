@@ -49,13 +49,42 @@ def load_project_state(project_dir: Path) -> dict:
     if state_path.exists():
         with open(state_path, "r") as f:
             return json.load(f)
-    return {"current_feature": None, "features": {}, "history": []}
+    return {"history": []}
 
 
 def save_project_state(project_dir: Path, state: dict) -> None:
     bot_dir = project_dir / ".claude-bot"
     bot_dir.mkdir(exist_ok=True)
     _atomic_write(bot_dir / "state.json", state)
+
+
+def load_feature_state(project_dir: Path) -> dict:
+    feature_path = project_dir / ".claude" / "features.json"
+    if feature_path.exists():
+        with open(feature_path, "r") as f:
+            return json.load(f)
+    # Migrate from old location if present
+    old_state_path = project_dir / ".claude-bot" / "state.json"
+    if old_state_path.exists():
+        with open(old_state_path, "r") as f:
+            old_state = json.load(f)
+        if "features" in old_state or "current_feature" in old_state:
+            migrated = {
+                "current_feature": old_state.pop("current_feature", None),
+                "features": old_state.pop("features", {}),
+            }
+            # Save migrated feature state to new location
+            save_feature_state(project_dir, migrated)
+            # Save remaining bot state without feature keys
+            _atomic_write(old_state_path, old_state)
+            return migrated
+    return {"current_feature": None, "features": {}}
+
+
+def save_feature_state(project_dir: Path, state: dict) -> None:
+    claude_dir = project_dir / ".claude"
+    claude_dir.mkdir(exist_ok=True)
+    _atomic_write(claude_dir / "features.json", state)
 
 
 def _atomic_write(path: Path, data: dict) -> None:

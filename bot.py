@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from core.claude_runner import ClaudeRunner
 from core.feature_manager import FeatureManager
 from core.project_manager import ProjectManager
+from core.voice_notifier import VoiceNotifier
 
 load_dotenv(override=True)
 
@@ -49,6 +50,7 @@ class ClaudeBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.claude_runner = ClaudeRunner()
         self.feature_manager = FeatureManager()
+        self.voice_notifier = VoiceNotifier(self)
         self.project_manager = ProjectManager(
             workspace_dir=WORKSPACE_DIR,
             guild_id=int(GUILD_ID),
@@ -64,6 +66,7 @@ class ClaudeBot(commands.Bot):
         await self.load_extension("discord_cogs.features")
         await self.load_extension("discord_cogs.claude_prompt")
         await self.load_extension("discord_cogs.status")
+        await self.load_extension("discord_cogs.voice")
 
         guild = discord.Object(id=int(GUILD_ID))
         self.tree.copy_global_to(guild=guild)

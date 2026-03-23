@@ -13,6 +13,7 @@ class Feature:
     total_output_tokens: int = 0
     total_cost_usd: float = 0.0
     prompt_count: int = 0
+    sessions: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {
@@ -26,6 +27,8 @@ class Feature:
         }
         if self.subdir:
             d["subdir"] = self.subdir
+        if self.sessions:
+            d["sessions"] = self.sessions
         return d
 
     @classmethod
@@ -40,4 +43,5 @@ class Feature:
             total_output_tokens=data.get("total_output_tokens", 0),
             total_cost_usd=data.get("total_cost_usd", 0.0),
             prompt_count=data.get("prompt_count", 0),
+            sessions=data.get("sessions", []),
         )
